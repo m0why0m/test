@@ -1,0 +1,194 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Barrett Reduction: 用于高效模运算
+void barrett_init(uint64_t q, uint64_t *mu) {
+    *mu = (uint64_t)( ( (uint128_t)1 << 64 ) / q );  // mu = floor(2^64 / q)
+}
+
+uint64_t barrett_reduce(uint64_t a, uint64_t q, uint64_t mu) {
+    uint64_t q_hat = (uint64_t)(( (uint128_t)mu * a ) >> 64);
+    uint64_t r = a - q_hat * q;
+    while (r >= q) r -= q;
+    return r;
+}
+
+// 快速模幂 (a^b mod q)
+uint64_t mod_exp(uint64_t base, uint64_t exp, uint64_t q, uint64_t mu) {
+    uint64_t result = 1;
+    base = barrett_reduce(base, q, mu);
+    while (exp) {
+        if (exp & 1) {
+            result = barrett_reduce(result * base, q, mu);
+        }
+        base = barrett_reduce(base * base, q, mu);
+        exp >>= 1;
+    }
+    return result;
+}
+
+// 位反转：将索引 i 位反转（log2(n) 位）
+uint32_t bit_reverse(uint32_t x, int logn) {
+    uint32_t result = 0;
+    for (int i = 0; i < logn; i++) {
+        result = (result << 1) | (x & 1);
+        x >>= 1;
+    }
+    return result;
+}
+
+// 位逆序重排（用于 NTT 输入重排）
+void bit_reverse_permute(uint64_t *poly, int n, uint64_t q, uint64_t mu) {
+    int logn = 0;
+    int temp = n;
+    while (temp > 1) { logn++; temp >>= 1; }
+
+    for (int i = 0; i < n; i++) {
+        int j = bit_reverse(i, logn);
+        if (i < j) {
+            uint64_t t = poly[i];
+            poly[i] = poly[j];
+            poly[j] = t;
+        }
+    }
+}
+
+// 预计算单位根表：roots[i] = omega^i mod q
+void precompute_roots(uint64_t *roots, int size, uint64_t omega, uint64_t q, uint64_t mu) {
+    roots[0] = 1;
+    for (int i = 1; i < size; i++) {
+        roots[i] = barrett_reduce(roots[i-1] * omega, q, mu);
+    }
+}
+
+// PNT 正变换（Partial NTT）
+// 输入：poly_in[n]，输出：poly_out[n]
+// 只进行 `levels` 层 radix-m 蝶形运算
+void pnt_forward(const uint64_t *poly_in, uint64_t *poly_out, int n, int levels, int m, uint64_t q, uint64_t g) {
+    // 初始化 Barrett 参数
+    uint64_t mu;
+    barrett_init(q, &mu);
+
+    // 1. 检查 m 是否为 2 的幂（简化只支持 m=2）
+    if (m != 2) {
+        fprintf(stderr, "Only radix-2 supported in this version.\n");
+        exit(1);
+    }
+
+    // 2. 计算本原 2n 次单位根: omega = g^{(q-1)/(2n)} mod q
+    uint64_t omega = mod_exp(g, (q - 1) / (2 * n), q, mu);
+
+    // 3. 复制输入并做位逆序重排
+    memcpy(poly_out, poly_in, n * sizeof(uint64_t));
+    bit_reverse_permute(poly_out, n, q, mu);
+
+    // 4. 开始 PNT 蝶形运算（共 levels 层）
+    int k = 1;  // 当前蝴蝶大小的一半
+    for (int layer = 0; layer < levels; layer++) {
+        // 当前层单位根：omega^{n / (2k)}
+        uint64_t omega_m = mod_exp(omega, n / (2 * k), q, mu);
+
+        // 预计算单位根表（0 到 k-1）
+        uint64_t *zetas = (uint64_t*)malloc(k * sizeof(uint64_t));
+        precompute_roots(zetas, k, omega_m, q, mu);
+
+        // 蝶形运算
+        for (int j = 0; j < n; j += 2*k) {
+            for (int i = 0; i < k; i++) {
+                uint64_t t_even = poly_out[j + i];
+                uint64_t t_odd  = barrett_reduce(poly_out[j + i + k] * zetas[i], q, mu);
+
+                poly_out[j + i]       = barrett_reduce(t_even + t_odd, q, mu);
+                poly_out[j + i + k]   = barrett_reduce(t_even - t_odd + q, q, mu);
+            }
+        }
+
+        free(zetas);
+        k <<= 1;  // k *= 2
+    }
+    // 此时 k = 2^levels，每块大小为 k
+}
+
+// PNT 逆变换（IPNT）
+void pnt_inverse(const uint64_t *poly_in, uint64_t *poly_out, int n, int levels, int m, uint64_t q, uint64_t g) {
+    uint64_t mu;
+    barrett_init(q, &mu);
+
+    if (m != 2) {
+        fprintf(stderr, "Only radix-2 supported.\n");
+        exit(1);
+    }
+
+    // 1. 计算本原根
+    uint64_t omega = mod_exp(g, (q - 1) / (2 * n), q, mu);
+    uint64_t omega_inv = mod_exp(omega, 2*n - 1, q, mu);  // omega^{-1} mod q
+
+    // 2. 复制输入
+    memcpy(poly_out, poly_in, n * sizeof(uint64_t));
+
+    // 3. 从最深层开始反向计算
+    int k = n >> levels;  // 初始块大小
+
+    for (int layer = levels - 1; layer >= 0; layer--) {
+        // 当前层单位根的逆：omega^{-n/(2k)}
+        uint64_t omega_m = mod_exp(omega_inv, n / (2 * k), q, mu);
+
+        // 预计算根表
+        uint64_t *zetas = (uint64_t*)malloc(k * sizeof(uint64_t));
+        precompute_roots(zetas, k, omega_m, q, mu);
+
+        // 蝶形逆运算
+        for (int j = 0; j < n; j += 2*k) {
+            for (int i = 0; i < k; i++) {
+                uint64_t t_even = poly_out[j + i];
+                uint64_t t_odd  = poly_out[j + i + k];
+
+                poly_out[j + i]     = barrett_reduce(t_even + t_odd, q, mu);
+                poly_out[j + i + k] = barrett_reduce((t_even - t_odd + q) * zetas[i], q, mu);
+            }
+        }
+
+        free(zetas);
+        k <<= 1;
+    }
+
+    // 4. 最后做位逆序重排（还原顺序）
+    bit_reverse_permute(poly_out, n, q, mu);
+
+    // 5. 乘以逆元 n^{-1} mod q
+    uint64_t n_inv = mod_exp(n, q - 2, q, mu);
+    for (int i = 0; i < n; i++) {
+        poly_out[i] = barrett_reduce(poly_out[i] * n_inv, q, mu);
+    }
+}
+
+int main() {
+    // 示例参数（CKKS 常用）
+    const int n = 8;           // 小规模测试
+    const int levels = 2;      // 只做 2 层
+    const int m = 2;           // radix-2
+    const uint64_t q = 12289;  // 素数，且 16 | (q-1)
+    const uint64_t g = 3;      // 3 是模 12289 的本原根
+
+    uint64_t poly_in[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint64_t poly_out[8] = {0};
+
+    printf("Input: ");
+    for (int i = 0; i < n; i++) printf("%lu ", poly_in[i]); printf("\n");
+
+    // PNT 正变换
+    pnt_forward(poly_in, poly_out, n, levels, m, q, g);
+
+    printf("PNT:   ");
+    for (int i = 0; i < n; i++) printf("%lu ", poly_out[i]); printf("\n");
+
+    // IPNT 逆变换
+    pnt_inverse(poly_out, poly_in, n, levels, m, q, g);
+
+    printf("Recon: ");
+    for (int i = 0; i < n; i++) printf("%lu ", poly_in[i]); printf("\n");
+
+    return 0;
+}
